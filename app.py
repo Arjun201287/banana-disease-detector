@@ -1,55 +1,80 @@
 # ==================== PRODUCTION APP FOR RENDER.COM ====================
 import os
+import sys
 import io
 import base64
 import warnings
+import gc
 import numpy as np
 import cv2
 from PIL import Image
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
+
+# ==================== CRITICAL: TensorFlow Memory Optimization ====================
+# MUST be set BEFORE importing tensorflow
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress INFO and WARNING logs
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # Disable oneDNN custom operations
+os.environ["OMP_NUM_THREADS"] = "1"  # Limit OpenMP threads
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"  # Limit inter-op threads
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"  # Limit intra-op threads
+os.environ["MKL_NUM_THREADS"] = "1"  # Limit MKL threads
+
+# Now import tensorflow with optimized settings
 import tensorflow as tf
-from tensorflow.keras.applications.efficientnet import EfficientNetB0, preprocess_input
-from tensorflow.keras.layers import GlobalMaxPooling2D, Dense, Dropout, BatchNormalization, Input
-from tensorflow.keras import Model
-import gdown
-import zipfile
+
+# Disable GPU completely (we're on CPU-only environment)
+tf.config.set_visible_devices([], 'GPU')
+
+# Limit CPU thread usage to reduce memory footprint
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+
+# Force TensorFlow to use minimal memory
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+            tf.config.experimental.set_virtual_device_configuration(
+                gpu,
+                [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=256)]
+            )
+    except RuntimeError:
+        pass
+
+# Enable garbage collection more frequently
+gc.set_threshold(100, 5, 5)
 
 warnings.filterwarnings("ignore")
 
 # ==================== CONFIGURATION ====================
-# For Render.com, use environment variables or direct paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(BASE_DIR, "checkpoints")
 WEIGHTS_PATH = os.path.join(CHECKPOINT_DIR, "model_best.weights.h5")
-IMG_SIZE = (224, 224)
+IMG_SIZE = (224, 224)  # Smaller is better for memory
+BATCH_SIZE = 1  # Always 1 for prediction
 
-# Create checkpoint directory if not exists
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# ==================== DOWNLOAD MODEL FROM GOOGLE DRIVE ====================
-# IMPORTANT: Upload your model to Google Drive and get the file ID
-# File ID from your Google Drive shareable link
-# Example: https://drive.google.com/file/d/XXXXXXXXXXXXX/view?usp=sharing
-MODEL_FILE_ID = "1pIxcmq4IbYX8kIMyx9YNFrYkAT0vI4Ff"  # 🔴 REPLACE THIS
+# ==================== DOWNLOAD MODEL ====================
+MODEL_FILE_ID = "1pIxcmq4IbYX8kIMyx9YNFrYkAT0vI4Ff"
 
 def download_model_from_drive():
     """Download model weights from Google Drive if not exists"""
     if not os.path.exists(WEIGHTS_PATH):
         print("📥 Downloading model weights from Google Drive...")
         try:
-            # Alternative: Use direct download URL
+            import gdown
             url = f"https://drive.google.com/uc?id={MODEL_FILE_ID}"
             gdown.download(url, WEIGHTS_PATH, quiet=False)
             print("✅ Model downloaded successfully!")
         except Exception as e:
             print(f"⚠️ Could not download from Drive: {e}")
-            print("Please upload model manually to Render storage")
-            # For Render, you can also use GitHub Releases or direct URL
     else:
         print("✅ Model weights found locally!")
 
-# ==================== CLASSES & PREVENTION ====================
+# ==================== CLASSES & DISEASE INFO ====================
 CLASS_NAMES = ['cordana', 'healthy', 'pestalotiopsis', 'sigatoka']
 NUM_CLASSES = len(CLASS_NAMES)
 
@@ -132,8 +157,16 @@ DISEASE_INFO = {
     }
 }
 
-# ==================== BUILD MODEL ====================
+# ==================== LAZY MODEL LOADING ====================
+# Global variable for model - loaded only on first request
+_model_instance = None
+
 def build_model(input_shape=(224,224,3), num_classes=NUM_CLASSES):
+    """Build the model architecture"""
+    from tensorflow.keras.applications.efficientnet import EfficientNetB0, preprocess_input
+    from tensorflow.keras.layers import GlobalMaxPooling2D, Dense, Dropout, BatchNormalization, Input
+    from tensorflow.keras import Model
+    
     base = EfficientNetB0(include_top=False, weights='imagenet', input_tensor=Input(shape=input_shape))
     base.trainable = False
     x = GlobalMaxPooling2D()(base.output)
@@ -144,71 +177,86 @@ def build_model(input_shape=(224,224,3), num_classes=NUM_CLASSES):
     model = Model(base.input, outputs)
     return model
 
-# ==================== LOAD MODEL ====================
-def load_trained_model():
-    try:
-        if os.path.exists(WEIGHTS_PATH):
-            print("Loading model architecture and weights...")
-            model = build_model()
-            model.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
-                          loss='categorical_crossentropy', metrics=['accuracy'])
-            model.load_weights(WEIGHTS_PATH)
-            print("✅ Model loaded successfully!")
-            return model
-        else:
-            print(f"⚠️ Weights not found at {WEIGHTS_PATH}")
-            print("⚠️ Running with random weights (for testing)")
-            model = build_model()
-            return model
-    except Exception as e:
-        print(f"⚠️ Error loading model: {e}")
-        print("⚠️ Creating new model with random weights")
-        return build_model()
+def get_model():
+    """Lazy load model - only loads when first needed"""
+    global _model_instance
+    if _model_instance is None:
+        print("🔄 Loading model (first request)...")
+        try:
+            _model_instance = build_model()
+            _model_instance.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
+                                    loss='categorical_crossentropy', 
+                                    metrics=['accuracy'])
+            
+            if os.path.exists(WEIGHTS_PATH):
+                _model_instance.load_weights(WEIGHTS_PATH)
+                print("✅ Model loaded successfully with weights!")
+            else:
+                print("⚠️ No weights found - using random weights (demo mode)")
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            _model_instance = build_model()
+            print("⚠️ Using fresh model as fallback")
+    return _model_instance
 
-# Download model first
+# Download weights at startup (doesn't load model yet)
 download_model_from_drive()
-model = load_trained_model()
 
 # ==================== PREPROCESS ====================
+from tensorflow.keras.applications.efficientnet import preprocess_input
+
 def preprocess_image(pil_img):
+    """Preprocess image for model input"""
     pil_img = pil_img.convert("RGB").resize(IMG_SIZE)
     arr = np.array(pil_img).astype(np.float32)
     arr = preprocess_input(arr)
     arr = np.expand_dims(arr, axis=0)
     return arr
 
-# ==================== GRAD-CAM ====================
+# ==================== SIMPLIFIED GRAD-CAM (Memory Efficient) ====================
 def find_last_conv_layer(m):
+    """Find last conv layer name"""
     for layer in reversed(m.layers):
         if isinstance(layer, (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D)):
             return layer.name
     return None
 
-def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, pred_index=None):
+def make_gradcam_heatmap(img_array, model, pred_index=None):
+    """Generate Grad-CAM heatmap"""
     try:
-        if last_conv_layer_name is None:
-            last_conv_layer_name = find_last_conv_layer(model)
+        last_conv_layer_name = find_last_conv_layer(model)
         if last_conv_layer_name is None:
             return None
         
-        grad_model = Model([model.inputs], [model.get_layer(last_conv_layer_name).output, model.output])
+        grad_model = tf.keras.models.Model(
+            [model.inputs], 
+            [model.get_layer(last_conv_layer_name).output, model.output]
+        )
+        
         with tf.GradientTape() as tape:
             conv_outputs, predictions = grad_model(img_array)
             if pred_index is None:
                 pred_index = tf.argmax(predictions[0])
             class_channel = predictions[:, pred_index]
+        
         grads = tape.gradient(class_channel, conv_outputs)
-        pooled_grads = tf.reduce_mean(grads, axis=(0,1,2))
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
         conv_outputs = conv_outputs[0]
         heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
         heatmap = tf.squeeze(heatmap)
         heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-8)
+        
+        # Clean up
+        del grad_model
+        gc.collect()
+        
         return heatmap.numpy()
     except Exception as e:
-        print(f"Grad-CAM error: {e}")
+        print(f"Grad-CAM error (non-critical): {e}")
         return None
 
 def overlay_heatmap(pil_img, heatmap, alpha=0.4):
+    """Overlay heatmap on original image"""
     if heatmap is None:
         return pil_img
     img = np.array(pil_img.convert("RGB").resize(IMG_SIZE))
@@ -219,7 +267,7 @@ def overlay_heatmap(pil_img, heatmap, alpha=0.4):
     superimposed = cv2.addWeighted(img, 1-alpha, heatmap_color, alpha, 0)
     return Image.fromarray(superimposed)
 
-# ==================== HTML TEMPLATE ====================
+# ==================== HTML TEMPLATE (Same as before) ====================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -228,19 +276,13 @@ HTML_TEMPLATE = '''
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>Banana Disease Detection - Farmer's Assistant</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             padding: 20px;
         }
-        
         .container {
             max-width: 1200px;
             margin: 0 auto;
@@ -249,28 +291,15 @@ HTML_TEMPLATE = '''
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             overflow: hidden;
         }
-        
         .header {
             background: linear-gradient(135deg, #2d5016, #4a7c23);
             color: white;
             padding: 30px;
             text-align: center;
         }
-        
-        .header h1 {
-            font-size: 2.5em;
-            margin-bottom: 10px;
-        }
-        
-        .header p {
-            font-size: 1.1em;
-            opacity: 0.95;
-        }
-        
-        .content {
-            padding: 40px;
-        }
-        
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .header p { font-size: 1.1em; opacity: 0.95; }
+        .content { padding: 40px; }
         .upload-area {
             border: 3px dashed #4a7c23;
             border-radius: 20px;
@@ -281,26 +310,10 @@ HTML_TEMPLATE = '''
             transition: all 0.3s ease;
             margin-bottom: 30px;
         }
-        
-        .upload-area:hover {
-            background: #f0f9e8;
-            border-color: #2d5016;
-        }
-        
-        .upload-area.drag-over {
-            background: #e8f5e1;
-            border-color: #1a4d00;
-        }
-        
-        .upload-icon {
-            font-size: 48px;
-            margin-bottom: 15px;
-        }
-        
-        .file-input {
-            display: none;
-        }
-        
+        .upload-area:hover { background: #f0f9e8; border-color: #2d5016; }
+        .upload-area.drag-over { background: #e8f5e1; border-color: #1a4d00; }
+        .upload-icon { font-size: 48px; margin-bottom: 15px; }
+        .file-input { display: none; }
         .btn {
             background: #4a7c23;
             color: white;
@@ -312,12 +325,7 @@ HTML_TEMPLATE = '''
             transition: transform 0.2s, background 0.2s;
             margin: 10px;
         }
-        
-        .btn:hover {
-            background: #2d5016;
-            transform: translateY(-2px);
-        }
-        
+        .btn:hover { background: #2d5016; transform: translateY(-2px); }
         .result-card {
             background: white;
             border-radius: 15px;
@@ -326,17 +334,11 @@ HTML_TEMPLATE = '''
             box-shadow: 0 5px 20px rgba(0,0,0,0.1);
             display: none;
         }
-        
-        .result-card.show {
-            display: block;
-            animation: fadeIn 0.5s ease;
-        }
-        
+        .result-card.show { display: block; animation: fadeIn 0.5s ease; }
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(20px); }
             to { opacity: 1; transform: translateY(0); }
         }
-        
         .prediction-header {
             display: flex;
             justify-content: space-between;
@@ -344,51 +346,29 @@ HTML_TEMPLATE = '''
             margin-bottom: 20px;
             flex-wrap: wrap;
         }
-        
-        .disease-name {
-            font-size: 1.8em;
-            font-weight: bold;
-        }
-        
+        .disease-name { font-size: 1.8em; font-weight: bold; }
         .severity {
             padding: 5px 15px;
             border-radius: 20px;
             font-weight: bold;
         }
-        
         .severity.High { background: #ff4757; color: white; }
         .severity.Moderate { background: #ffa502; color: white; }
         .severity.None { background: #2ed573; color: white; }
-        
-        .confidence {
-            font-size: 1.2em;
-            color: #666;
-            margin-bottom: 20px;
-        }
-        
-        .image-container {
-            text-align: center;
-            margin: 20px 0;
-        }
-        
+        .confidence { font-size: 1.2em; color: #666; margin-bottom: 20px; }
+        .image-container { text-align: center; margin: 20px 0; }
         .result-image {
             max-width: 100%;
             border-radius: 10px;
             box-shadow: 0 5px 15px rgba(0,0,0,0.2);
         }
-        
         .info-section {
             margin-top: 25px;
             padding: 20px;
             background: #f8f9fa;
             border-radius: 10px;
         }
-        
-        .info-section h3 {
-            color: #4a7c23;
-            margin-bottom: 15px;
-        }
-        
+        .info-section h3 { color: #4a7c23; margin-bottom: 15px; }
         .symptoms {
             background: #fff3cd;
             padding: 15px;
@@ -396,17 +376,10 @@ HTML_TEMPLATE = '''
             margin: 15px 0;
             border-left: 4px solid #ffc107;
         }
-        
-        .prevention, .treatment, .organic {
-            margin: 15px 0;
-            padding: 15px;
-            border-radius: 8px;
-        }
-        
+        .prevention, .treatment, .organic { margin: 15px 0; padding: 15px; border-radius: 8px; }
         .prevention { background: #d4edda; border-left: 4px solid #28a745; }
         .treatment { background: #f8d7da; border-left: 4px solid #dc3545; }
         .organic { background: #d1ecf1; border-left: 4px solid #17a2b8; }
-        
         .loader {
             border: 3px solid #f3f3f3;
             border-top: 3px solid #4a7c23;
@@ -417,12 +390,10 @@ HTML_TEMPLATE = '''
             margin: 20px auto;
             display: none;
         }
-        
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-        
         .footer {
             background: #2d5016;
             color: white;
@@ -430,7 +401,14 @@ HTML_TEMPLATE = '''
             padding: 20px;
             font-size: 0.9em;
         }
-        
+        .warning-banner {
+            background: #fff3cd;
+            color: #856404;
+            padding: 10px;
+            text-align: center;
+            font-size: 0.9em;
+            border-bottom: 1px solid #ffeeba;
+        }
         @media (max-width: 768px) {
             .content { padding: 20px; }
             .header h1 { font-size: 1.5em; }
@@ -444,7 +422,9 @@ HTML_TEMPLATE = '''
             <h1>🍌 Banana Disease Detection Assistant</h1>
             <p>AI-Powered Diagnosis for Healthy Banana Plants</p>
         </div>
-        
+        <div class="warning-banner">
+            ⚡ First prediction may take 30-60 seconds as the AI model loads. Please wait!
+        </div>
         <div class="content">
             <div class="upload-area" id="uploadArea">
                 <div class="upload-icon">📸</div>
@@ -456,6 +436,7 @@ HTML_TEMPLATE = '''
             </div>
             
             <div class="loader" id="loader"></div>
+            <div id="loadingStatus" style="text-align: center; color: #666; display: none;">Processing image...</div>
             
             <div class="result-card" id="resultCard">
                 <div class="prediction-header">
@@ -491,6 +472,7 @@ HTML_TEMPLATE = '''
         const uploadArea = document.getElementById('uploadArea');
         const fileInput = document.getElementById('fileInput');
         const loader = document.getElementById('loader');
+        const loadingStatus = document.getElementById('loadingStatus');
         const resultCard = document.getElementById('resultCard');
         
         uploadArea.addEventListener('click', () => fileInput.click());
@@ -524,7 +506,11 @@ HTML_TEMPLATE = '''
             formData.append('file', file);
             
             loader.style.display = 'block';
+            loadingStatus.style.display = 'block';
             resultCard.classList.remove('show');
+            loadingStatus.textContent = '📤 Uploading and analyzing image...';
+            
+            const startTime = Date.now();
             
             try {
                 const response = await fetch('/predict', {
@@ -533,12 +519,18 @@ HTML_TEMPLATE = '''
                 });
                 
                 const data = await response.json();
+                const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                loadingStatus.textContent = `✅ Analysis complete in ${elapsed} seconds`;
                 displayResult(data);
             } catch (error) {
                 alert('Error processing image. Please try again.');
                 console.error(error);
+                loadingStatus.textContent = '❌ Error occurred. Please try again.';
             } finally {
                 loader.style.display = 'none';
+                setTimeout(() => {
+                    loadingStatus.style.display = 'none';
+                }, 2000);
             }
         }
         
@@ -578,10 +570,16 @@ def home():
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint for Render"""
-    return jsonify({"status": "healthy", "model_loaded": model is not None})
+    return jsonify({
+        "status": "healthy", 
+        "model_loaded": _model_instance is not None,
+        "memory_optimized": True
+    })
 
 @app.route("/predict", methods=["POST"])
 def predict_route():
+    """Main prediction endpoint - memory optimized"""
+    result = None
     try:
         if "file" not in request.files:
             return jsonify({"error": "No file uploaded"}), 400
@@ -589,9 +587,14 @@ def predict_route():
         file = request.files["file"]
         pil_img = Image.open(file.stream).convert("RGB")
         
-        # Preprocess and predict
+        # Preprocess image
         x = preprocess_image(pil_img)
-        preds = model.predict(x)
+        
+        # Get model (lazy loads on first request)
+        model = get_model()
+        
+        # Make prediction
+        preds = model.predict(x, verbose=0)  # verbose=0 reduces memory
         class_id = int(np.argmax(preds[0]))
         confidence = float(np.max(preds[0])) * 100
         label = CLASS_NAMES[class_id]
@@ -599,17 +602,19 @@ def predict_route():
         # Get disease information
         info = DISEASE_INFO.get(label, DISEASE_INFO["healthy"])
         
-        # Generate Grad-CAM heatmap
+        # Generate Grad-CAM heatmap (optional, skip if memory critical)
         cam_b64 = None
         try:
             heatmap = make_gradcam_heatmap(x, model, pred_index=class_id)
             if heatmap is not None:
                 cam_img = overlay_heatmap(pil_img, heatmap, alpha=0.45)
                 buf = io.BytesIO()
-                cam_img.save(buf, format="PNG")
+                cam_img.save(buf, format="PNG", optimize=True)  # optimize reduces size
                 cam_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                del cam_img
+                buf.close()
         except Exception as e:
-            print(f"Grad-CAM failed: {e}")
+            print(f"Grad-CAM skipped (non-critical): {e}")
         
         # Prepare response
         response = {
@@ -623,13 +628,25 @@ def predict_route():
             "gradcam_image": cam_b64
         }
         
+        # Force garbage collection after prediction
+        del preds
+        del x
+        gc.collect()
+        
         return jsonify(response)
     
     except Exception as e:
         print(f"Prediction error: {e}")
+        gc.collect()
         return jsonify({"error": str(e)}), 500
 
 # ==================== RUN APP ====================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    print("=" * 50)
+    print("🍌 Banana Disease Detection API")
+    print(f"📍 Running on port: {port}")
+    print("⚡ Model will load on first prediction request")
+    print("💾 Memory optimized for Render free tier")
+    print("=" * 50)
     app.run(host="0.0.0.0", port=port)
