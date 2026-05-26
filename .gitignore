@@ -1,9 +1,0 @@
-*.pyc
-__pycache__/
-checkpoints/
-*.h5
-*.keras
-.DS_Store
-.env
-venv/
-env/
